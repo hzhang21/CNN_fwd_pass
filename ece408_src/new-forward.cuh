@@ -11,7 +11,7 @@ namespace mxnet
 namespace op
 {
 
-__global__ void forward_kernel(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int K)
+__global__ void forward_kernel(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int K, int W_grid)
 {
 
     /*
@@ -26,7 +26,6 @@ __global__ void forward_kernel(float *y, const float *x, const float *k, const i
     (void)H_out; // silence declared but never referenced warning. remove this line when you start working
     (void)W_out; // silence declared but never referenced warning. remove this line when you start working
 
-    int W_grid = (W_out % TILE_WIDTH == 0) ? (W_out/TILE_WIDTH) : ((W_out/TILE_WIDTH) + 1);   //ceil(W_out/TILE_WIDTH);
     int b, m, h, w, c, p, q;
     b = blockIdx.x;
     m = blockIdx.y;
@@ -81,8 +80,8 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
     const int H_out = H - K + 1;
     const int W_out = W - K + 1;
 
-    int W_grid = ceil(W_out/TILE_WIDTH);
-    int H_grid = ceil(H_out/TILE_WIDTH);
+    int W_grid = ceil(1.0*W_out/TILE_WIDTH);
+    int H_grid = ceil(1.0*H_out/TILE_WIDTH);
     int Z = W_grid * H_grid;
 
     // Set the kernel dimensions
@@ -91,7 +90,7 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
 
     // Call the kernel
     //forward_kernel<<<gridDim, blockDim, 0, s>>>(y.dptr_,x.dptr_,w.dptr_, B,M,C,H,W,K);
-    forward_kernel<<<gridDim, blockDim>>>(y.dptr_,x.dptr_,w.dptr_, B,M,C,H,W,K);
+    forward_kernel<<<gridDim, blockDim>>>(y.dptr_,x.dptr_,w.dptr_, B,M,C,H,W,K, W_grid);
 
     // Use MSHADOW_CUDA_CALL to check for CUDA runtime errors.
     MSHADOW_CUDA_CALL(cudaDeviceSynchronize());
