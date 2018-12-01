@@ -34,10 +34,7 @@ __global__ void unroll_kernel(const int C, const int H, const int W, const int K
                 X_unroll[h_unroll*W_unroll + w_unroll] = x4d(b,c,h_out+p,w_out+q);
             }
         }
-
     }
-
-
 #undef x4d
 }
 
@@ -54,26 +51,25 @@ __global__ void forward_kernel(float *y, const float *k, const int B, const int 
     const int H_out = H - K + 1;
     const int W_out = W - K + 1;
 
-#define y4d(i3, i2, i1, i0) y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
-#define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
-#define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
+//#define y4d(i3, i2, i1, i0) y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
+//#define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
 
 
     // ------------- MATRIX MULTIPLY -------------
 
     // matrix A dimensions (k4d)
     int numARows = M;
-    int numAColumns = C*K*K; // h_unroll
+    int numAColumns = C*K*K; // W_unroll
 
     // matrix B dimensions (X_unroll)
     int numBRows = numAColumns;
-    int numBColumns = H_out * W_out // w_unroll
+    int numBColumns = H_out * W_out // H_unroll
 
     // matrix C dimensions (y4d)
     int numCRows = numARows;
     int numCColumns = numBColumns;
 
-    int width = C * K * K; //numAColumns == numBRows == h_unroll == C * K * K
+    int width = numAColumns; //numAColumns == numBRows == W_unroll == C * K * K
 
     __shared__ float tileA[TILE_WIDTH][TILE_WIDTH];   //to hold filter-bank matrix,   k4d
     __shared__ float tileB[TILE_WIDTH][TILE_WIDTH];   //to hold input features,       x4d
@@ -86,7 +82,7 @@ __global__ void forward_kernel(float *y, const float *k, const int B, const int 
     for(int tile = 0; tile < (width + TILE_WIDTH-1)/TILE_WIDTH; tile++) { //for tile in tiles
         if(tile*TILE_WIDTH + threadIdx.x < width && row < numCRows) {
             //tileA[threadIdx.y][threadIdx.x] = A[row*numAColumns + tile*TILE_WIDTH+threadIdx.x]; //REPLACE WITH BELOW
-            tileA[threadIdx.y][threadIdx.x] = k4d( , , , ); //TODO
+            tileA[threadIdx.y][threadIdx.x] = k[row*numAColumns + tile*TILE_WIDTH+threadIdx.x]; //TODO  (m,c,p,q)
         } else {
             tileA[threadIdx.y][threadIdx.x] = 0.0;
         }
@@ -106,15 +102,14 @@ __global__ void forward_kernel(float *y, const float *k, const int B, const int 
 
     }
     if(row < numCRows && col < numCColumns) {
-        C[row*numCColumns + col] = dot_product; //REPLACE WITH BELOW
-        y4d(b, , , ) = dot_product; //TODO
+        //C[row*numCColumns + col] = dot_product; //REPLACE WITH BELOW
+        y[(b * M * H_out * W_out) + row*numCColumns + col] = dot_product;
     }
 
     // ------------- MATRIX MULTIPLY END -------------
 
-#undef y4d
-#undef x4d
-#undef k4d
+//#undef y4d
+//#undef k4d
 }
 
 /*
@@ -155,15 +150,15 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
     dim3 blockDim_unroll(C*H_out*W_out, 1, 1);
 
     // Set the kernel dimensions
-    dim3 gridDim(B, M, Z);
-    dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
+    dim3 dimGrid(ceil(1.0*H_unroll/TILE_WIDTH), ceil(1.0*M/TILE_WIDTH), 1);
+    dim3 dimBlock(TILE_WIDTH, TILE_WIDTH, 1);
 
     for (int b = 0; b < B; b++) {
         //unroll
         unroll_kernel<<<gridDim_unroll, blockDim_unroll>>>(C, H, W, K, x.dptr_, X_unrolled, b);
 
         //matrix multiply
-        forward_kernel<<<gridDim, blockDim>>>(y.dptr_,w.dptr_, B,M,C,H,W,K, W_grid, X_unrolled, b);
+        forward_kernel<<<dimGrid, dimBlock>>>(y.dptr_,w.dptr_, B,M,C,H,W,K, W_grid, X_unrolled, b);
     }
 
     // ----------- ADDITIONAL CODE END ----------
