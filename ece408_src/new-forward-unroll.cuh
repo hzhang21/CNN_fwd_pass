@@ -31,7 +31,9 @@ __global__ void unroll_kernel(const int C, const int H, const int W, const int K
         for (p = 0; p < K; p++) {
             for (q = 0; q < K; q++) {
                 w_unroll = w_base + p * K + q;
-                X_unroll[h_unroll*W_unroll + w_unroll] = x4d(b,c,h_idx+p,w_idx+q); //I THINK BUG IS HEREl
+                if (h_unroll*W_unroll + w_unroll < C*W_unroll) { // without this line, i get memory access error (X_unroll)
+                    X_unroll[h_unroll*W_unroll + w_unroll] = x4d(b,c,h_idx+p,w_idx+q); //I THINK BUG IS HERE!
+                }
             }
         }
     }
