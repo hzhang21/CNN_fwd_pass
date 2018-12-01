@@ -5,14 +5,14 @@
 #include <mxnet/base.h>
 
 #define TILE_WIDTH 16
-#define UNROLL_BLOCK_SIZE 1024
+#define UNROLL_BLOCK_SIZE 16
 
 namespace mxnet
 {
 namespace op
 {
 
-__global__ void unroll_kernel(const int C, const int H, const int W, const int K, const float* x, float* X_unroll, int b))
+__global__ void unroll_kernel(const int C, const int H, const int W, const int K, const float* x, float* X_unroll, int b)
 {
 #define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
     int c, s, h_idx, w_idx, h_unroll, w_base, p, q, w_unroll;
@@ -31,7 +31,7 @@ __global__ void unroll_kernel(const int C, const int H, const int W, const int K
         for (p = 0; p < K; p++) {
             for (q = 0; q < K; q++) {
                 w_unroll = w_base + p * K + q;
-                X_unroll[h_unroll*W_unroll + w_unroll] = x4d(b,c,h_out+p,w_out+q);
+                X_unroll[h_unroll*W_unroll + w_unroll] = x4d(b,c,h_idx+p,w_idx+q); //I THINK BUG IS HEREl
             }
         }
     }
@@ -51,22 +51,18 @@ __global__ void forward_kernel(float *y, const float *k, const int B, const int 
     const int H_out = H - K + 1;
     const int W_out = W - K + 1;
 
-//#define y4d(i3, i2, i1, i0) y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
-//#define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
-
-
     // ------------- MATRIX MULTIPLY -------------
 
     // matrix A dimensions (k4d)
-    int numARows = M;
+    //int numARows = M;
     int numAColumns = C*K*K; // W_unroll
 
     // matrix B dimensions (X_unroll)
-    int numBRows = numAColumns;
-    int numBColumns = H_out * W_out // H_unroll
+    //int numBRows = numAColumns;
+    int numBColumns = H_out * W_out; // H_unroll
 
     // matrix C dimensions (y4d)
-    int numCRows = numARows;
+    int numCRows = M; //numARows;
     int numCColumns = numBColumns;
 
     int width = numAColumns; //numAColumns == numBRows == W_unroll == C * K * K
@@ -108,8 +104,7 @@ __global__ void forward_kernel(float *y, const float *k, const int B, const int 
 
     // ------------- MATRIX MULTIPLY END -------------
 
-//#undef y4d
-//#undef k4d
+
 }
 
 /*
@@ -140,14 +135,18 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
 
     int W_grid = ceil(1.0*W_out/TILE_WIDTH);
     int H_grid = ceil(1.0*H_out/TILE_WIDTH);
-    int Z = W_grid * H_grid;
 
     // ------------ADDITIONAL UNROLL CODE START -------------
+    float *X_unrolled;
+    float *X_unrolled_device;
     int W_unroll = C * K * K;
     int H_unroll = H_out * W_out;
-    float *X_unrolled = malloc(W_unroll*H_unroll*sizeof(float));
+    X_unrolled = (float *)malloc(W_unroll*H_unroll*sizeof(float));
+    cudaMalloc((void**) &X_unrolled_device, W_unroll*H_unroll*sizeof(float));
+    cudaMemcpy(X_unrolled_device, X_unrolled, W_unroll*H_unroll*sizeof(float), cudaMemcpyHostToDevice);
+
     dim3 gridDim_unroll(ceil(1.0*C*H_out*W_out/UNROLL_BLOCK_SIZE), 1, 1);
-    dim3 blockDim_unroll(C*H_out*W_out, 1, 1);
+    dim3 blockDim_unroll(UNROLL_BLOCK_SIZE, 1, 1);
 
     // Set the kernel dimensions
     dim3 dimGrid(ceil(1.0*H_unroll/TILE_WIDTH), ceil(1.0*M/TILE_WIDTH), 1);
@@ -155,15 +154,14 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
 
     for (int b = 0; b < B; b++) {
         //unroll
-        unroll_kernel<<<gridDim_unroll, blockDim_unroll>>>(C, H, W, K, x.dptr_, X_unrolled, b);
+        unroll_kernel<<<gridDim_unroll, blockDim_unroll>>>(C, H, W, K, x.dptr_, X_unrolled_device, b);
 
         //matrix multiply
-        forward_kernel<<<dimGrid, dimBlock>>>(y.dptr_,w.dptr_, B,M,C,H,W,K, W_grid, X_unrolled, b);
+        forward_kernel<<<dimGrid, dimBlock>>>(y.dptr_,w.dptr_, B,M,C,H,W,K, W_grid, X_unrolled_device, b);
     }
-
+    cudaFree(X_unrolled_device);
+    free(X_unrolled);
     // ----------- ADDITIONAL CODE END ----------
-
-
 
     // Use MSHADOW_CUDA_CALL to check for CUDA runtime errors.
     MSHADOW_CUDA_CALL(cudaDeviceSynchronize());
