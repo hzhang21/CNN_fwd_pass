@@ -5,7 +5,7 @@
 #include <mxnet/base.h>
 
 #define TILE_WIDTH 16
-#define UNROLL_BLOCK_SIZE 16
+#define UNROLL_BLOCK_SIZE 32
 
 namespace mxnet
 {
@@ -26,14 +26,12 @@ __global__ void unroll_kernel(const int C, const int H, const int W, const int K
         s = t % W_unroll;
         h_idx = s / W_out;
         w_idx = s % W_out;
-        h_unroll = h_idx * W_out + w_idx;
+        w_unroll = h_idx * W_out + w_idx;
         w_base = c * K * K;
         for (p = 0; p < K; p++) {
             for (q = 0; q < K; q++) {
-                w_unroll = w_base + p * K + q;
-                if (h_unroll*W_unroll + w_unroll < C*W_unroll) { // without this line, i get memory access error (X_unroll)
-                    X_unroll[h_unroll*W_unroll + w_unroll] = x4d(b,c,h_idx+p,w_idx+q); //I THINK BUG IS HERE!
-                }
+                h_unroll = w_base + p * K + q;
+                X_unroll[h_unroll*W_unroll + w_unroll] = x4d(b,c,h_idx+p,w_idx+q); //I THINK BUG IS HERE!
             }
         }
     }
@@ -139,13 +137,10 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
     int H_grid = ceil(1.0*H_out/TILE_WIDTH);
 
     // ------------ADDITIONAL UNROLL CODE START -------------
-    float *X_unrolled;
     float *X_unrolled_device;
     int W_unroll = C * K * K;
     int H_unroll = H_out * W_out;
-    X_unrolled = (float *)malloc(W_unroll*H_unroll*sizeof(float));
     cudaMalloc((void**) &X_unrolled_device, W_unroll*H_unroll*sizeof(float));
-    cudaMemcpy(X_unrolled_device, X_unrolled, W_unroll*H_unroll*sizeof(float), cudaMemcpyHostToDevice);
 
     dim3 gridDim_unroll(ceil(1.0*C*H_out*W_out/UNROLL_BLOCK_SIZE), 1, 1);
     dim3 blockDim_unroll(UNROLL_BLOCK_SIZE, 1, 1);
@@ -162,7 +157,6 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
         forward_kernel<<<dimGrid, dimBlock>>>(y.dptr_,w.dptr_, B,M,C,H,W,K, W_grid, X_unrolled_device, b);
     }
     cudaFree(X_unrolled_device);
-    free(X_unrolled);
     // ----------- ADDITIONAL CODE END ----------
 
     // Use MSHADOW_CUDA_CALL to check for CUDA runtime errors.
