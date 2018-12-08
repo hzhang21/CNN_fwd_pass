@@ -1,44 +1,16 @@
-
 #ifndef MXNET_OPERATOR_NEW_FORWARD_CUH_
 #define MXNET_OPERATOR_NEW_FORWARD_CUH_
 
 #include <mxnet/base.h>
 
 #define TILE_WIDTH 16
-#define UNROLL_BLOCK_SIZE 32
 
 namespace mxnet
 {
 namespace op
 {
 
-__global__ void unroll_kernel(const int C, const int H, const int W, const int K, const float* x, float* X_unroll, int b)
-{
-#define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
-    int c, s, h_idx, w_idx, h_unroll, w_base, p, q, w_unroll;
-    int t = blockIdx.x * UNROLL_BLOCK_SIZE + threadIdx.x;
-    int H_out = H - K + 1;
-    int W_out = W - K + 1;
-    int W_unroll = H_out * W_out;
-
-    if (t < C*W_unroll) {
-        c = t / W_unroll;
-        s = t % W_unroll;
-        h_idx = s / W_out;
-        w_idx = s % W_out;
-        w_unroll = h_idx * W_out + w_idx;
-        w_base = c * K * K;
-        for (p = 0; p < K; p++) {
-            for (q = 0; q < K; q++) {
-                h_unroll = w_base + p * K + q;
-                X_unroll[h_unroll*W_unroll + w_unroll] = x4d(b,c,h_idx+p,w_idx+q); //I THINK BUG IS HERE!
-            }
-        }
-    }
-#undef x4d
-}
-
-__global__ void forward_kernel(float *y, const float *k, const int B, const int M, const int C, const int H, const int W, const int K, int W_grid, float* X_unroll, int b)
+__global__ void forward_kernel(float *x, float *y, const float *k, const int B, const int M, const int C, const int H, const int W, const int K, int W_grid)
 {
 
     /*
@@ -47,9 +19,12 @@ __global__ void forward_kernel(float *y, const float *k, const int B, const int 
     The goal here is to be correct AND fast.
     We have some nice #defs for you below to simplify indexing. Feel free to use them, or create your own.
     */
+#define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
 
     const int H_out = H - K + 1;
     const int W_out = W - K + 1;
+
+    int b = blockIdx.z;
 
     // ------------- MATRIX MULTIPLY -------------
 
@@ -74,18 +49,24 @@ __global__ void forward_kernel(float *y, const float *k, const int B, const int 
     int col = blockIdx.x * TILE_WIDTH + threadIdx.x;
 
     float dot_product = 0;
+    int x_c, x_h, x_w, x_p, x_q, x_pq;
+
 
     for(int tile = 0; tile < (width + TILE_WIDTH-1)/TILE_WIDTH; tile++) { //for tile in tiles
         if(tile*TILE_WIDTH + threadIdx.x < width && row < numCRows) {
-            //tileA[threadIdx.y][threadIdx.x] = A[row*numAColumns + tile*TILE_WIDTH+threadIdx.x]; //REPLACE WITH BELOW
             tileA[threadIdx.y][threadIdx.x] = k[row*numAColumns + tile*TILE_WIDTH+threadIdx.x]; //TODO  (m,c,p,q)
         } else {
             tileA[threadIdx.y][threadIdx.x] = 0.0;
         }
 
         if(tile*TILE_WIDTH + threadIdx.y < width && col < numCColumns) {
-            //tileB[threadIdx.y][threadIdx.x] = B[(tile*TILE_WIDTH+threadIdx.y)*numBColumns+col]; //REPLACE WITH BELOW
-            tileB[threadIdx.y][threadIdx.x] = X_unroll[(tile*TILE_WIDTH+threadIdx.y)*numBColumns+col]; //TODO
+            x_c = (tile*TILE_WIDTH+threadIdx.y)/(K*K);
+            x_h = col/W_out;
+            x_w = col%W_out; // = w_idx
+            x_pq = (tile*TILE_WIDTH+threadIdx.y)%(K*K); // = p*K + q
+            x_p = x_pq/K;
+            x_q = x_pq%K;
+            tileB[threadIdx.y][threadIdx.x] = x4d(b, x_c, x_h + x_p, x_w + x_q); //X_unroll[(tile*TILE_WIDTH+threadIdx.y)*numBColumns+col];
         } else {
             tileB[threadIdx.y][threadIdx.x] = 0.0;
         }
@@ -104,7 +85,7 @@ __global__ void forward_kernel(float *y, const float *k, const int B, const int 
 
     // ------------- MATRIX MULTIPLY END -------------
 
-
+#undef x4d
 }
 
 /*
@@ -137,26 +118,16 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
     int H_grid = ceil(1.0*H_out/TILE_WIDTH);
 
     // ------------ADDITIONAL UNROLL CODE START -------------
-    float *X_unrolled_device;
-    int W_unroll = C * K * K;
+    //int W_unroll = C * K * K;
     int H_unroll = H_out * W_out;
-    cudaMalloc((void**) &X_unrolled_device, W_unroll*H_unroll*sizeof(float));
-
-    dim3 gridDim_unroll(ceil(1.0*C*H_out*W_out/UNROLL_BLOCK_SIZE), 1, 1);
-    dim3 blockDim_unroll(UNROLL_BLOCK_SIZE, 1, 1);
 
     // Set the kernel dimensions
-    dim3 dimGrid(ceil(1.0*H_unroll/TILE_WIDTH), ceil(1.0*M/TILE_WIDTH), 1);
+    dim3 dimGrid(ceil(1.0*H_unroll/TILE_WIDTH), ceil(1.0*M/TILE_WIDTH), B);
     dim3 dimBlock(TILE_WIDTH, TILE_WIDTH, 1);
 
-    for (int b = 0; b < B; b++) {
-        //unroll
-        unroll_kernel<<<gridDim_unroll, blockDim_unroll>>>(C, H, W, K, x.dptr_, X_unrolled_device, b);
+    forward_kernel<<<dimGrid, dimBlock>>>(x.dptr_, y.dptr_,w.dptr_, B,M,C,H,W,K, W_grid);
 
-        //matrix multiply
-        forward_kernel<<<dimGrid, dimBlock>>>(y.dptr_,w.dptr_, B,M,C,H,W,K, W_grid, X_unrolled_device, b);
-    }
-    cudaFree(X_unrolled_device);
+
     // ----------- ADDITIONAL CODE END ----------
 
     // Use MSHADOW_CUDA_CALL to check for CUDA runtime errors.
@@ -177,3 +148,5 @@ void forward(mshadow::Tensor<gpu, 4, DType> &y, const mshadow::Tensor<gpu, 4, DT
 }
 
 #endif
+
+//grid dim (ceil(H_out*W_out/TILE_WIDTH), ceil(M/TILE_WIDTH), B)
